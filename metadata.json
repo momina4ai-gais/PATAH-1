@@ -1,0 +1,6 @@
+{
+  "name": "PATAH - Delivery Assistance & Order Confirmation",
+  "description": "Zero-friction merchant order parsing, customer doorstep location pin and voice directions confirmation, printable parcel QR stickers, and one-tap rider navigation.",
+  "requestFramePermissions": ["geolocation", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
