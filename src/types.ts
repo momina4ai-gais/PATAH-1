@@ -18,6 +18,8 @@ export interface VoiceNoteData {
   audioMimeType?: string;
   durationSeconds: number;
   transcript: string;
+  urduTranscript?: string;
+  romanUrduTranscript?: string;
   englishTranslation?: string;
   isValidDirections: boolean;
   landmarks: string[];
@@ -50,6 +52,7 @@ export interface Order {
   assistanceToken: string;
   createdAt: string;
   updatedAt: string;
+  deliveredAt?: string;
   merchantNotes?: string;
 }
 
@@ -72,8 +75,18 @@ export interface VerifyVoiceResponse {
   isValid: boolean;
   confidence: number;
   landmarks: string[];
+  urduTranscript?: string;
+  romanUrduTranscript?: string;
   englishTranslation: string;
   originalTranscript: string;
   feedback: string;
   fallback?: boolean;
+}
+
+export interface MerchantUser {
+  id: string;
+  name: string;
+  storeName: string;
+  emailOrPhone: string;
+  city?: string;
 }

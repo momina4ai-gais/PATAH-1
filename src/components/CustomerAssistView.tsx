@@ -2,24 +2,19 @@ import React, { useState, useEffect } from 'react';
 import { Order } from '../types';
 import { LeafletMap } from './LeafletMap';
 import { VoiceRecorderService, AudioRecordingResult } from '../lib/voiceRecorder';
-import { verifyVoiceDirections, confirmOrderAssistance } from '../lib/api';
+import { verifyVoiceDirections, confirmOrderAssistance, reverseGeocodeLocation } from '../lib/api';
+import { romanUrduToUrduScript } from '../lib/urduTransliterate';
 import {
   MapPin,
   Mic,
-  MicOff,
+  Square,
   Play,
   Pause,
-  RotateCcw,
-  CheckCircle2,
+  Check,
   AlertCircle,
-  Sparkles,
-  ArrowRight,
-  ShieldCheck,
-  Package,
   Navigation,
-  Volume2,
+  Loader2,
   Lock,
-  Compass,
 } from 'lucide-react';
 
 interface CustomerAssistViewProps {
@@ -28,107 +23,186 @@ interface CustomerAssistViewProps {
   onBackToMerchant?: () => void;
 }
 
+const CITY_COORDS: Record<string, [number, number]> = {
+  'jalalpur jattan': [32.6416, 74.2064],
+  gujrat: [32.5742, 74.0754],
+  kharian: [32.8142, 73.8647],
+  sialkot: [32.4945, 74.5229],
+  gujranwala: [32.1877, 74.1945],
+  lahore: [31.5204, 74.3587],
+  islamabad: [33.6844, 73.0479],
+  rawalpindi: [33.5973, 73.0479],
+  karachi: [24.8607, 67.0011],
+  faisalabad: [31.4504, 73.135],
+  multan: [30.1575, 71.5249],
+  peshawar: [34.0151, 71.5249],
+  quetta: [30.1798, 66.975],
+  hyderabad: [25.396, 68.3578],
+  sargodha: [32.0836, 72.6711],
+  abbottabad: [34.1688, 73.2215],
+};
+
 export const CustomerAssistView: React.FC<CustomerAssistViewProps> = ({
   order,
   onAssistanceCompleted,
-  onBackToMerchant,
 }) => {
-  // Pin location state (default near city center or existing pin)
-  const [pinLat, setPinLat] = useState<number>(order.pin?.lat || (order.city.toLowerCase().includes('karachi') ? 24.8607 : order.city.toLowerCase().includes('islamabad') ? 33.6844 : 31.5204));
-  const [pinLng, setPinLng] = useState<number>(order.pin?.lng || (order.city.toLowerCase().includes('karachi') ? 67.0011 : order.city.toLowerCase().includes('islamabad') ? 73.0479 : 74.3587));
-  const [landmarkLabel, setLandmarkLabel] = useState<string>(order.pin?.landmarkLabel || '');
-  const [isLocating, setIsLocating] = useState<boolean>(false);
-  const [locationError, setLocationError] = useState<string | null>(null);
+  const fallbackCoords = CITY_COORDS[(order.city || '').toLowerCase()] || [31.5204, 74.3587];
+  const initialLat = order.pin?.lat || fallbackCoords[0];
+  const initialLng = order.pin?.lng || fallbackCoords[1];
 
-  // Audio recording state
+  // Pin state
+  const [pinLat, setPinLat] = useState<number>(initialLat);
+  const [pinLng, setPinLng] = useState<number>(initialLng);
+  const [hasDroppedPin, setHasDroppedPin] = useState<boolean>(Boolean(order.pin?.lat));
+  const userHasMovedPinRef = React.useRef<boolean>(Boolean(order.pin?.lat));
+  const [droppedAddress, setDroppedAddress] = useState<string>('');
+  const [isResolvingAddress, setIsResolvingAddress] = useState<boolean>(false);
+  const [isLocating, setIsLocating] = useState<boolean>(false);
+
+  // Voice recording state
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [recordTimer, setRecordTimer] = useState<number>(0);
   const [audioResult, setAudioResult] = useState<AudioRecordingResult | null>(null);
-  const [recordedTranscript, setRecordedTranscript] = useState<string>(order.voiceNote?.transcript || '');
   const [audioPlaying, setAudioPlaying] = useState<boolean>(false);
   const [recorderService] = useState<VoiceRecorderService>(() => new VoiceRecorderService());
   const [audioElement, setAudioElement] = useState<HTMLAudioElement | null>(null);
 
-  // Verification & Submission state
-  const [isVerifying, setIsVerifying] = useState<boolean>(false);
-  const [verificationFeedback, setVerificationFeedback] = useState<{
-    isValid: boolean;
-    feedback: string;
-    landmarks?: string[];
-  } | null>(null);
-  const [isSubmittedSuccess, setIsSubmittedSuccess] = useState<boolean>(order.status === 'CONFIRMED');
+  // Transcripts
+  const [urduTranscript, setUrduTranscript] = useState<string>(
+    order.voiceNote?.urduTranscript || ''
+  );
+  const [romanUrduTranscript, setRomanUrduTranscript] = useState<string>(
+    order.voiceNote?.romanUrduTranscript || order.voiceNote?.transcript || ''
+  );
 
-  // Handle live timer during recording
+  // Submission state
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isConfirmed, setIsConfirmed] = useState<boolean>(order.status === 'CONFIRMED');
+
+  // Center map on order city if no existing pin
   useEffect(() => {
-    let interval: NodeJS.Timeout | null = null;
-    if (isRecording) {
-      interval = setInterval(() => {
-        setRecordTimer((prev) => prev + 1);
-      }, 1000);
-    } else {
-      setRecordTimer(0);
+    if (order.pin?.lat && order.pin?.lng) return;
+    if (userHasMovedPinRef.current) return;
+    let isCancelled = false;
+
+    async function centerCity() {
+      try {
+        const queries = order.deliveryAddress
+          ? [`${order.deliveryAddress}, ${order.city}, Pakistan`, `${order.city}, Pakistan`]
+          : [`${order.city}, Pakistan`];
+        for (const query of queries) {
+          if (isCancelled || userHasMovedPinRef.current) return;
+          const res = await fetch(
+            `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&countrycodes=pk&limit=1`
+          );
+          if (res.ok) {
+            const results = await res.json();
+            if (!isCancelled && !userHasMovedPinRef.current && results?.[0]) {
+              const lat = parseFloat(results[0].lat);
+              const lng = parseFloat(results[0].lon);
+              if (!isNaN(lat) && !isNaN(lng)) {
+                setPinLat(lat);
+                setPinLng(lng);
+                return;
+              }
+            }
+          }
+        }
+      } catch {
+        // Keep fallback coordinates
+      }
     }
+
+    centerCity();
     return () => {
-      if (interval) clearInterval(interval);
+      isCancelled = true;
     };
+  }, [order.id, order.city, order.deliveryAddress, order.pin]);
+
+  // Reverse geocode whenever user drops or moves the pin
+  useEffect(() => {
+    if (!hasDroppedPin) return;
+    let isCancelled = false;
+
+    async function fetchLocationName() {
+      setIsResolvingAddress(true);
+      const res = await reverseGeocodeLocation(pinLat, pinLng);
+      if (!isCancelled) {
+        setDroppedAddress(res.displayName || `${pinLat.toFixed(5)}, ${pinLng.toFixed(5)}`);
+        setIsResolvingAddress(false);
+      }
+    }
+
+    fetchLocationName();
+    return () => {
+      isCancelled = true;
+    };
+  }, [pinLat, pinLng, hasDroppedPin]);
+
+  // Recording timer
+  useEffect(() => {
+    if (!isRecording) {
+      setRecordTimer(0);
+      return;
+    }
+    const interval = setInterval(() => setRecordTimer((t) => t + 1), 1000);
+    return () => clearInterval(interval);
   }, [isRecording]);
 
-  // Clean audio on unmount
+  // Cleanup audio on unmount
   useEffect(() => {
     return () => {
-      if (audioElement) {
-        audioElement.pause();
-      }
+      audioElement?.pause();
     };
   }, [audioElement]);
 
-  // GPS Location handler using HTML5 Geolocation API
-  const handleUseCurrentLocation = () => {
-    setIsLocating(true);
-    setLocationError(null);
+  const handleMapSelect = (lat: number, lng: number) => {
+    userHasMovedPinRef.current = true;
+    setPinLat(lat);
+    setPinLng(lng);
+    setHasDroppedPin(true);
+    setIsConfirmed(false);
+    setErrorMessage(null);
+  };
 
+  const handleUseGPS = () => {
     if (!navigator.geolocation) {
-      setLocationError('Geolocation is not supported by your browser.');
-      setIsLocating(false);
+      setErrorMessage('GPS is not supported on this browser. Tap on the map to drop a pin.');
       return;
     }
-
+    setIsLocating(true);
+    setErrorMessage(null);
     navigator.geolocation.getCurrentPosition(
-      (position) => {
-        setPinLat(position.coords.latitude);
-        setPinLng(position.coords.longitude);
+      (pos) => {
+        handleMapSelect(pos.coords.latitude, pos.coords.longitude);
         setIsLocating(false);
       },
-      (error) => {
-        console.warn('Geolocation error:', error.message);
-        setLocationError('Could not retrieve GPS location. Tap directly on the map to place your pin.');
+      () => {
+        setErrorMessage('Could not access GPS. Tap directly on the map to place your pin.');
         setIsLocating(false);
       },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+      { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
     );
   };
 
   const handleStartRecording = async () => {
-    setVerificationFeedback(null);
+    setErrorMessage(null);
+    setIsConfirmed(false);
+
     const started = await recorderService.startRecording((liveText) => {
-      setRecordedTranscript(liveText);
+      setRomanUrduTranscript(liveText);
+      setUrduTranscript(romanUrduToUrduScript(liveText));
     });
 
     if (started) {
       setIsRecording(true);
     } else {
-      // If microphone hardware permission is restricted, offer fallback speech prompt
-      const manualDirection = prompt(
-        'Microphone access is unavailable or restricted in this browser frame. Please type or speak your door directions (e.g. "Blue gate, behind the mosque, second house"):'
-      );
-      if (manualDirection && manualDirection.trim()) {
-        setRecordedTranscript(manualDirection.trim());
-        setAudioResult({
-          blob: new Blob([], { type: 'audio/webm' }),
-          audioUrl: '',
-          base64: '',
-          durationSeconds: 6,
-        });
+      const fallbackText = prompt('Microphone unavailable. Type directions in Roman Urdu:');
+      if (fallbackText?.trim()) {
+        const clean = fallbackText.trim();
+        setRomanUrduTranscript(clean);
+        setUrduTranscript(romanUrduToUrduScript(clean));
       }
     }
   };
@@ -138,9 +212,10 @@ export const CustomerAssistView: React.FC<CustomerAssistViewProps> = ({
     const result = await recorderService.stopRecording();
     setAudioResult(result);
 
-    // If transcript is still empty (e.g. Web Speech API unsupported), provide a default prompt or placeholder
-    if (!recordedTranscript.trim()) {
-      setRecordedTranscript(recorderService.transcriptSoFar || 'Blue gate, right behind the mosque, second house on the left.');
+    const captured = recorderService.transcriptSoFar || romanUrduTranscript;
+    if (captured) {
+      setRomanUrduTranscript(captured);
+      setUrduTranscript(romanUrduToUrduScript(captured));
     }
 
     if (result.audioUrl) {
@@ -150,7 +225,13 @@ export const CustomerAssistView: React.FC<CustomerAssistViewProps> = ({
     }
   };
 
-  const handleToggleAudioPlay = () => {
+  const handleRomanUrduChange = (val: string) => {
+    setRomanUrduTranscript(val);
+    setUrduTranscript(romanUrduToUrduScript(val));
+    setIsConfirmed(false);
+  };
+
+  const handleTogglePlayback = () => {
     if (!audioElement) return;
     if (audioPlaying) {
       audioElement.pause();
@@ -161,60 +242,58 @@ export const CustomerAssistView: React.FC<CustomerAssistViewProps> = ({
     }
   };
 
-  // Quick preset voice notes for fast demo testing
-  const handleUsePreset = (presetTranscript: string, isSilentTest = false) => {
-    setRecordedTranscript(presetTranscript);
-    setAudioResult({
-      blob: new Blob([], { type: 'audio/webm' }),
-      audioUrl: '',
-      base64: '',
-      durationSeconds: isSilentTest ? 2 : 8,
-    });
-    setVerificationFeedback(null);
-  };
-
-  // Final submission of pin + voice directions
-  const handleSubmitConfirmation = async () => {
-    if (!recordedTranscript.trim()) {
-      setVerificationFeedback({
-        isValid: false,
-        feedback: 'Please record or provide door-finding voice instructions before submitting.',
-      });
+  const handleConfirm = async () => {
+    if (!hasDroppedPin) {
+      setErrorMessage('Please tap on the map to drop your location pin.');
       return;
     }
 
-    setIsVerifying(true);
-    setVerificationFeedback(null);
+    const activeText = urduTranscript.trim() || romanUrduTranscript.trim();
+    if (!activeText) {
+      setErrorMessage('Please record a voice note with directions to your door.');
+      return;
+    }
+
+    setIsSubmitting(true);
+    setErrorMessage(null);
 
     try {
-      // 1. Verify voice note validity with AI
-      const verifyRes = await verifyVoiceDirections(recordedTranscript, audioResult?.base64);
+      const verifyRes = await verifyVoiceDirections(activeText, audioResult?.base64);
+
+      const finalUrdu =
+        verifyRes.urduTranscript && /[\u0600-\u06FF]/.test(verifyRes.urduTranscript)
+          ? verifyRes.urduTranscript
+          : romanUrduToUrduScript(verifyRes.romanUrduTranscript || activeText) || activeText;
+      const finalRoman = verifyRes.romanUrduTranscript || romanUrduTranscript || activeText;
+
+      setUrduTranscript(finalUrdu);
+      setRomanUrduTranscript(finalRoman);
 
       if (!verifyRes.isValid) {
-        setVerificationFeedback({
-          isValid: false,
-          feedback:
-            verifyRes.feedback ||
-            'Directions unclear: Please mention your gate color, nearby landmark, or street turn.',
-        });
-        setIsVerifying(false);
+        setErrorMessage(
+          verifyRes.feedback ||
+            'Please mention a nearby landmark, street name, or gate color to help the rider.'
+        );
+        setIsSubmitting(false);
         return;
       }
 
-      // 2. Submit pin and verified directions
       const updatedOrder = await confirmOrderAssistance(order.id, {
+        orderSnapshot: order,
         pin: {
           lat: pinLat,
           lng: pinLng,
           accuracy: 8,
-          landmarkLabel: landmarkLabel || 'Verified doorstep pin',
+          landmarkLabel: droppedAddress || 'Customer Doorstep',
         },
         voiceNote: {
           audioBase64: audioResult?.base64,
           audioUrl: audioResult?.audioUrl,
           audioMimeType: 'audio/webm',
-          durationSeconds: audioResult?.durationSeconds || 7,
-          transcript: recordedTranscript,
+          durationSeconds: audioResult?.durationSeconds || 6,
+          transcript: finalRoman,
+          urduTranscript: finalUrdu,
+          romanUrduTranscript: finalRoman,
           englishTranslation: verifyRes.englishTranslation,
           isValidDirections: true,
           landmarks: verifyRes.landmarks,
@@ -222,356 +301,223 @@ export const CustomerAssistView: React.FC<CustomerAssistViewProps> = ({
         },
       });
 
-      setVerificationFeedback({
-        isValid: true,
-        feedback: verifyRes.feedback,
-        landmarks: verifyRes.landmarks,
-      });
-
-      setIsSubmittedSuccess(true);
+      setIsConfirmed(true);
       onAssistanceCompleted(updatedOrder);
-    } catch (err: any) {
-      console.error('Error confirming order:', err);
-      setVerificationFeedback({
-        isValid: false,
-        feedback: 'Failed to confirm. Please check your connection and retry.',
-      });
+    } catch {
+      setErrorMessage('Could not save your details. Please try again.');
     } finally {
-      setIsVerifying(false);
+      setIsSubmitting(false);
     }
   };
 
+  if (order.status === 'DELIVERED') {
+    return (
+      <div className="min-h-screen bg-white text-slate-900 flex justify-center py-10 px-4">
+        <div className="w-full max-w-md space-y-6">
+          <header className="border-b border-slate-200 pb-4 flex items-baseline justify-between">
+            <div>
+              <h1 className="text-lg font-semibold tracking-tight text-slate-900">
+                Delivery Completed
+              </h1>
+              <p className="text-sm text-slate-500 mt-0.5">
+                Order #{order.orderNumber}
+              </p>
+            </div>
+            <span className="text-xs font-medium text-slate-500">Delivered</span>
+          </header>
+
+          <div className="bg-slate-50 border border-slate-200 rounded-lg p-6 text-center space-y-3">
+            <div className="w-11 h-11 rounded bg-slate-200 text-slate-700 flex items-center justify-center mx-auto">
+              <Lock className="w-5 h-5" />
+            </div>
+            <h2 className="text-base font-semibold text-slate-900">
+              Confirmation link closed
+            </h2>
+            <p className="text-sm text-slate-600 leading-relaxed">
+              This parcel has already been marked as delivered. Location pinning and voice instructions are no longer needed.
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="min-h-screen bg-slate-900/60 py-6 px-3 sm:px-6 flex justify-center">
-      <div className="w-full max-w-lg bg-white rounded border border-slate-300 shadow-xl overflow-hidden flex flex-col">
-        {/* Top Header */}
-        <div className="bg-slate-950 text-white p-5 border-b border-slate-800">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2.5">
-              <span className="w-7 h-7 rounded bg-emerald-600 text-white font-bold flex items-center justify-center text-xs">
-                P
-              </span>
-              <div>
-                <h1 className="font-bold text-sm tracking-tight">PATAH Delivery Assistance</h1>
-                <p className="text-[11px] text-slate-400">Order Verification &bull; Doorstep Pin</p>
-              </div>
-            </div>
-
-            {onBackToMerchant && (
-              <button
-                onClick={onBackToMerchant}
-                className="text-xs font-medium text-slate-300 hover:text-white bg-slate-800 px-2.5 py-1 rounded border border-slate-700"
-              >
-                &larr; Merchant View
-              </button>
-            )}
-          </div>
-
-          {/* Real intent confirmation note */}
-          <div className="mt-4 bg-slate-900 border border-slate-700 rounded p-3 flex items-start gap-2.5">
-            <ShieldCheck className="w-4 h-4 text-emerald-400 flex-shrink-0 mt-0.5" />
-            <div className="text-xs text-slate-300">
-              <p className="font-semibold text-slate-100">Order Confirmation Step</p>
-              <p className="text-[11px] text-slate-400 mt-0.5">
-                Both your <strong>exact map pin</strong> and <strong>voice note</strong> are
-                compulsory to unlock dispatch. This confirms you are ready to receive the parcel and
-                allows the courier to locate your door directly.
-              </p>
-            </div>
-          </div>
-        </div>
-
-        {/* Order Summary */}
-        <div className="bg-slate-50 border-b border-slate-200 px-5 py-3 flex items-center justify-between text-xs">
+    <div className="min-h-screen bg-white text-slate-900 flex justify-center py-8 px-4">
+      <div className="w-full max-w-md space-y-8">
+        {/* Header */}
+        <header className="border-b border-slate-200 pb-4 flex items-baseline justify-between">
           <div>
-            <span className="font-mono font-semibold text-slate-800">Order #{order.orderNumber}</span>
-            <p className="text-slate-500 text-[11px]">
-              {order.items.map((i) => `${i.quantity}x ${i.name}`).join(', ')}
+            <h1 className="text-lg font-semibold tracking-tight text-slate-900">
+              Confirm Delivery Location
+            </h1>
+            <p className="text-sm text-slate-500 mt-0.5">
+              Order #{order.orderNumber} &middot; {order.customerName}
             </p>
           </div>
-          <div className="text-right">
-            <span className="font-bold text-slate-900">
-              {order.currency} {order.totalAmount.toLocaleString()}
-            </span>
-            <p className="text-emerald-700 font-medium text-[11px] flex items-center gap-1 justify-end">
-              <Package className="w-3 h-3" /> Ready for dispatch
-            </p>
-          </div>
-        </div>
+          <span className="text-xs font-medium text-[#01411C]">{order.city}</span>
+        </header>
 
-        {/* Main Content Area */}
-        <div className="p-5 space-y-5 flex-1 overflow-y-auto">
-          {/* Success Banner if already confirmed */}
-          {isSubmittedSuccess && (
-            <div className="bg-emerald-50 border border-emerald-300 rounded p-4 text-center space-y-2">
-              <div className="w-10 h-10 bg-emerald-600 text-white rounded flex items-center justify-center mx-auto">
-                <CheckCircle2 className="w-6 h-6" />
-              </div>
-              <h2 className="text-sm font-bold text-emerald-950">Order Verified and Confirmed</h2>
-              <p className="text-xs text-emerald-800 max-w-sm mx-auto">
-                Your exact doorstep pin and voice directions have been saved. The merchant can now
-                print the unlocked parcel QR label for courier dispatch.
-              </p>
-              <div className="bg-white p-3 rounded border border-emerald-200 text-left text-xs text-slate-700 mt-2">
-                <p className="font-semibold text-slate-900 mb-1 flex items-center gap-1.5">
-                  <Volume2 className="w-4 h-4 text-emerald-700" /> Doorstep directions saved:
+        {/* Step 1: Drop Pin on Map */}
+        <section className="space-y-3">
+          <div className="flex items-center justify-between">
+            <label className="text-sm font-medium text-slate-900">
+              1. Drop a pin at your doorstep
+            </label>
+            <button
+              type="button"
+              onClick={handleUseGPS}
+              disabled={isLocating}
+              className="text-xs font-medium text-[#01411C] hover:underline flex items-center gap-1 cursor-pointer disabled:opacity-50"
+            >
+              <Navigation className="w-3 h-3" />
+              {isLocating ? 'Locating...' : 'Use current GPS'}
+            </button>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 overflow-hidden">
+            <LeafletMap
+              center={[pinLat, pinLng]}
+              markerPosition={[pinLat, pinLng]}
+              onLocationSelect={handleMapSelect}
+              className="h-64 w-full cursor-crosshair"
+              markerLabel="Delivery Pin"
+              showLayerToggle={true}
+            />
+          </div>
+
+          {hasDroppedPin ? (
+            <div className="flex items-start gap-2 text-sm text-slate-700 bg-slate-50 px-3 py-2.5 rounded-lg border border-slate-200">
+              <MapPin className="w-4 h-4 text-[#01411C] shrink-0 mt-0.5" />
+              <div className="leading-snug space-y-0.5">
+                <div>
+                  <span className="font-medium text-slate-900">Your dropped pin location: </span>
+                  {isResolvingAddress ? (
+                    <span className="text-slate-400">Finding street name...</span>
+                  ) : (
+                    <span>{droppedAddress}</span>
+                  )}
+                </div>
+                <p className="text-xs font-mono text-slate-500">
+                  Pin coordinates: {pinLat.toFixed(5)}, {pinLng.toFixed(5)}
                 </p>
-                <p className="text-slate-600 italic">"{recordedTranscript}"</p>
               </div>
             </div>
-          )}
-
-          {/* STEP 1: Pin on OpenStreetMap */}
-          <div className="space-y-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="w-5 h-5 rounded bg-slate-900 text-white font-bold text-xs flex items-center justify-center">
-                  1
-                </span>
-                <label className="text-xs font-bold text-slate-900 uppercase tracking-wider">
-                  Drop Door Pin on Map
-                </label>
-              </div>
-              <span className="text-[10px] font-bold text-slate-700 bg-slate-100 border border-slate-300 px-2 py-0.5 rounded">
-                Compulsory
-              </span>
-            </div>
-
-            <p className="text-xs text-slate-600">
-              Drag the marker or tap on the map to pinpoint your exact gate or door entrance.
+          ) : (
+            <p className="text-xs text-slate-500">
+              Tap anywhere on the map above to drop your pin.
             </p>
+          )}
+        </section>
 
-            <div className="relative">
-              <LeafletMap
-                center={[pinLat, pinLng]}
-                markerPosition={[pinLat, pinLng]}
-                onLocationSelect={(lat, lng) => {
-                  setPinLat(lat);
-                  setPinLng(lng);
-                }}
-                className="h-64 w-full rounded border border-slate-300 overflow-hidden shadow-xs"
-                markerLabel="Your Door Entrance"
-              />
+        {/* Step 2: Voice Note for Guidance */}
+        <section className="space-y-4 pt-2 border-t border-slate-100">
+          <div>
+            <label className="text-sm font-medium text-slate-900 block">
+              2. Enter a voice note for guidance
+            </label>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Mention a nearby landmark, street, or gate color in Urdu.
+            </p>
+          </div>
 
-              {/* Quick Locate Button */}
+          <div className="flex items-center gap-2">
+            {!isRecording ? (
               <button
                 type="button"
-                onClick={handleUseCurrentLocation}
-                disabled={isLocating}
-                className="absolute top-2.5 right-2.5 z-[1000] bg-white hover:bg-slate-50 text-slate-800 text-xs font-semibold px-2.5 py-1.5 rounded border border-slate-300 flex items-center gap-1.5 shadow-sm cursor-pointer"
+                onClick={handleStartRecording}
+                className="flex-1 py-2.5 px-4 rounded-lg border border-slate-300 hover:border-[#01411C] hover:bg-emerald-50/40 text-sm font-medium text-slate-900 flex items-center justify-center gap-2 transition-colors cursor-pointer"
               >
-                <Compass className="w-3.5 h-3.5 text-emerald-700" />
-                {isLocating ? 'Finding GPS...' : 'Use My GPS'}
+                <Mic className="w-4 h-4 text-[#01411C]" />
+                {audioResult ? 'Record Again' : 'Record Voice Note'}
               </button>
-            </div>
-
-            {locationError && (
-              <p className="text-[11px] text-amber-800 flex items-center gap-1">
-                <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" /> {locationError}
-              </p>
+            ) : (
+              <button
+                type="button"
+                onClick={handleStopRecording}
+                className="flex-1 py-2.5 px-4 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium flex items-center justify-center gap-2 transition-colors cursor-pointer"
+              >
+                <Square className="w-3.5 h-3.5 fill-current" />
+                Stop Recording ({recordTimer}s)
+              </button>
             )}
 
+            {audioElement && !isRecording && (
+              <button
+                type="button"
+                onClick={handleTogglePlayback}
+                className="p-2.5 rounded-lg border border-slate-300 hover:bg-slate-50 text-slate-700 cursor-pointer"
+                aria-label="Play voice note"
+              >
+                {audioPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+              </button>
+            )}
+          </div>
+
+          {/* Transcriptions in Urdu & Roman Urdu */}
+          <div className="space-y-3 pt-1">
             <div>
-              <label className="text-[11px] font-medium text-slate-700 block mb-1">
-                Doorstep Landmark or Building Name (Optional note for rider):
+              <label className="block text-xs font-medium text-slate-600 mb-1">
+                Urdu Transcript (اردو)
               </label>
-              <input
-                type="text"
-                value={landmarkLabel}
-                onChange={(e) => setLandmarkLabel(e.target.value)}
-                placeholder="e.g. Next to Madni Mosque, Flat 402, 2nd floor"
-                className="w-full text-xs px-3 py-2 rounded border border-slate-300 focus:outline-none focus:border-slate-800 bg-white"
+              <textarea
+                rows={2}
+                dir="rtl"
+                value={urduTranscript}
+                onChange={(e) => setUrduTranscript(e.target.value)}
+                placeholder="جامع مسجد کے پیچھے، سبز گیٹ والا گھر..."
+                className="w-full text-sm px-3 py-2 rounded-lg border border-slate-200 focus:border-[#01411C] focus:outline-none font-serif leading-relaxed"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">
+                Roman Urdu Transcript
+              </label>
+              <textarea
+                rows={2}
+                value={romanUrduTranscript}
+                onChange={(e) => handleRomanUrduChange(e.target.value)}
+                placeholder="Jamia masjid ke peechay, sabz gate wala ghar..."
+                className="w-full text-sm px-3 py-2 rounded-lg border border-slate-200 focus:border-[#01411C] focus:outline-none"
               />
             </div>
           </div>
+        </section>
 
-          {/* STEP 2: Voice Note Directions */}
-          <div className="space-y-2.5 pt-4 border-t border-slate-200">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="w-5 h-5 rounded bg-slate-900 text-white font-bold text-xs flex items-center justify-center">
-                  2
-                </span>
-                <label className="text-xs font-bold text-slate-900 uppercase tracking-wider">
-                  Record Voice Note
-                </label>
-              </div>
-              <span className="text-[10px] font-bold text-slate-700 bg-slate-100 border border-slate-300 px-2 py-0.5 rounded">
-                Compulsory
-              </span>
-            </div>
-
-            <p className="text-xs text-slate-600">
-              Explain how to find your door from the main street in your own language (e.g. "blue gate, behind the mosque, second house").
-            </p>
-
-            {/* Recorder Card */}
-            <div className="bg-slate-50 border border-slate-200 rounded p-4 space-y-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <div
-                    className={`w-2.5 h-2.5 rounded-sm ${
-                      isRecording ? 'bg-red-600' : 'bg-slate-400'
-                    }`}
-                  />
-                  <span className="text-xs font-mono font-medium text-slate-800">
-                    {isRecording ? `Recording: ${recordTimer}s` : 'Ready to record voice note'}
-                  </span>
-                </div>
-
-                {audioResult && !isRecording && (
-                  <span className="text-[11px] text-emerald-800 font-medium bg-emerald-50 border border-emerald-300 px-2 py-0.5 rounded">
-                    Recorded ({audioResult.durationSeconds}s)
-                  </span>
-                )}
-              </div>
-
-              {/* Main Record Action Button */}
-              <div className="flex items-center gap-2.5">
-                {!isRecording ? (
-                  <button
-                    type="button"
-                    onClick={handleStartRecording}
-                    className="flex-1 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold py-2.5 px-4 rounded flex items-center justify-center gap-2 transition-colors cursor-pointer"
-                  >
-                    <Mic className="w-4 h-4" />
-                    Record Voice Directions
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={handleStopRecording}
-                    className="flex-1 bg-red-700 hover:bg-red-800 text-white text-xs font-semibold py-2.5 px-4 rounded flex items-center justify-center gap-2 transition-colors cursor-pointer"
-                  >
-                    <MicOff className="w-4 h-4" />
-                    Stop Recording ({recordTimer}s)
-                  </button>
-                )}
-
-                {/* Play Audio Button */}
-                {audioElement && !isRecording && (
-                  <button
-                    type="button"
-                    onClick={handleToggleAudioPlay}
-                    className="w-10 h-10 bg-white hover:bg-slate-100 border border-slate-300 text-slate-800 rounded flex items-center justify-center cursor-pointer"
-                    title="Play recorded audio"
-                  >
-                    {audioPlaying ? (
-                      <Pause className="w-4 h-4 text-emerald-700" />
-                    ) : (
-                      <Play className="w-4 h-4 text-emerald-700 ml-0.5" />
-                    )}
-                  </button>
-                )}
-              </div>
-
-              {/* Spoken Transcript Preview */}
-              <div>
-                <label className="text-[11px] font-medium text-slate-700 block mb-1">
-                  Transcribed Directions:
-                </label>
-                <textarea
-                  rows={2}
-                  value={recordedTranscript}
-                  onChange={(e) => setRecordedTranscript(e.target.value)}
-                  placeholder="Voice note transcript will appear here. You can also edit or fine-tune words..."
-                  className="w-full text-xs p-2 rounded border border-slate-300 focus:outline-none focus:border-slate-800 bg-white"
-                />
-              </div>
-
-              {/* Quick Preset Buttons for Instant Demo Testing */}
-              <div className="pt-2 border-t border-slate-200">
-                <span className="text-[10px] text-slate-500 block mb-1.5 uppercase tracking-wide">
-                  Quick test voice notes:
-                </span>
-                <div className="flex flex-wrap gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleUsePreset(
-                        'Street 19 pe enter hoke samnay Madni Masjid aayegi, masjid ke bilkul peechay gali mein second house hai, blue gate aur bahar white Corolla khari hogi.'
-                      )
-                    }
-                    className="text-[10px] bg-white hover:bg-slate-100 text-slate-800 border border-slate-300 px-2 py-1 rounded cursor-pointer"
-                  >
-                    Urdu: Masjid and Blue Gate
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleUsePreset(
-                        'Take the left turn after City Bakery, 3rd house on the right with green gate, bell is on the pillar.'
-                      )
-                    }
-                    className="text-[10px] bg-white hover:bg-slate-100 text-slate-800 border border-slate-300 px-2 py-1 rounded cursor-pointer"
-                  >
-                    English: Green Gate and Bakery
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleUsePreset('...haan theek hai bhai...', true)}
-                    className="text-[10px] bg-red-50 hover:bg-red-100 text-red-800 border border-red-300 px-2 py-1 rounded cursor-pointer"
-                    title="Test invalid audio / rejection handling"
-                  >
-                    Test Invalid Audio
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {/* Validation Feedback Banner */}
-            {verificationFeedback && (
-              <div
-                className={`p-3 rounded border text-xs flex items-start gap-2.5 ${
-                  verificationFeedback.isValid
-                    ? 'bg-emerald-50 border-emerald-300 text-emerald-900'
-                    : 'bg-amber-50 border-amber-300 text-amber-900'
-                }`}
-              >
-                {verificationFeedback.isValid ? (
-                  <CheckCircle2 className="w-4 h-4 text-emerald-700 flex-shrink-0 mt-0.5" />
-                ) : (
-                  <AlertCircle className="w-4 h-4 text-amber-700 flex-shrink-0 mt-0.5" />
-                )}
-                <div>
-                  <p className="font-semibold">
-                    {verificationFeedback.isValid
-                      ? 'Direction Validation Passed'
-                      : 'Unclear Directions Detected'}
-                  </p>
-                  <p className="text-[11px] mt-0.5">{verificationFeedback.feedback}</p>
-                </div>
-              </div>
-            )}
+        {/* Feedback Messages */}
+        {errorMessage && (
+          <div className="flex items-start gap-2 text-xs text-red-700 bg-red-50 px-3 py-2.5 rounded-lg border border-red-200">
+            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+            <span>{errorMessage}</span>
           </div>
-        </div>
+        )}
 
-        {/* Bottom Submission Footer */}
-        <div className="p-4 bg-slate-100 border-t border-slate-200">
-          <button
-            type="button"
-            onClick={handleSubmitConfirmation}
-            disabled={isVerifying || isRecording}
-            className="w-full bg-slate-900 hover:bg-slate-800 text-white font-semibold py-3 px-4 rounded flex items-center justify-center gap-2 text-xs transition-colors cursor-pointer disabled:opacity-50"
-          >
-            {isVerifying ? (
-              <>Validating Doorstep Directions...</>
-            ) : isSubmittedSuccess ? (
-              <>
-                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                Update Saved Confirmation
-              </>
-            ) : (
-              <>
-                Confirm Intent and Unlock Parcel QR
-                <ArrowRight className="w-4 h-4" />
-              </>
-            )}
-          </button>
-          <p className="text-[10px] text-center text-slate-500 mt-2">
-            PATAH Delivery Confirmation. Zero-friction courier parcel handoff.
-          </p>
-        </div>
+        {isConfirmed && !errorMessage && (
+          <div className="flex items-center gap-2 text-xs font-medium text-[#01411C] bg-emerald-50 px-3 py-2.5 rounded-lg border border-emerald-200">
+            <Check className="w-4 h-4 shrink-0" />
+            <span>Location and voice guidance confirmed for the rider.</span>
+          </div>
+        )}
+
+        {/* Confirm Button */}
+        <button
+          type="button"
+          onClick={handleConfirm}
+          disabled={isSubmitting || isRecording}
+          className="w-full py-3 px-4 rounded-lg bg-[#01411C] hover:bg-[#013215] text-white text-sm font-medium transition-colors flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+        >
+          {isSubmitting ? (
+            <>
+              <Loader2 className="w-4 h-4 animate-spin" />
+              Confirming...
+            </>
+          ) : isConfirmed ? (
+            'Confirmed'
+          ) : (
+            'Confirm'
+          )}
+        </button>
       </div>
     </div>
   );

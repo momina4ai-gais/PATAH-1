@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import { Order, OrderItem } from '../types';
-import { createOrder, parseOrderChatText, updateOrderStatus } from '../lib/api';
+import { createOrder, parseOrderChatText, updateOrderStatus, encodeOrderForQR, copyTextToClipboard } from '../lib/api';
 import { PrintLabelModal } from './PrintLabelModal';
+import { LeafletMap } from './LeafletMap';
 import {
   Plus,
   Search,
@@ -17,13 +18,17 @@ import {
   MessageSquare,
   ArrowRight,
   Package,
+  MapPin,
   ExternalLink,
+  Lock,
+  RefreshCw,
 } from 'lucide-react';
 
 interface MerchantDashboardProps {
   orders: Order[];
   onOrderCreated: (order: Order) => void;
   onOrderUpdated: (order: Order) => void;
+  onRefresh?: () => Promise<void>;
   isNewOrderModalOpen: boolean;
   setIsNewOrderModalOpen: (open: boolean) => void;
 }
@@ -32,13 +37,17 @@ export const MerchantDashboard: React.FC<MerchantDashboardProps> = ({
   orders,
   onOrderCreated,
   onOrderUpdated,
+  onRefresh,
   isNewOrderModalOpen,
   setIsNewOrderModalOpen,
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
   const [activePrintOrder, setActivePrintOrder] = useState<Order | null>(null);
+  const [inspectingPinOrder, setInspectingPinOrder] = useState<Order | null>(null);
   const [copiedOrderId, setCopiedOrderId] = useState<string | null>(null);
+  const [updatingOrderId, setUpdatingOrderId] = useState<string | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
 
   // New Order Form State
   const [rawChatText, setRawChatText] = useState('');
@@ -52,11 +61,14 @@ export const MerchantDashboard: React.FC<MerchantDashboardProps> = ({
   const [chatPlatform, setChatPlatform] = useState<Order['chatPlatform']>('WhatsApp');
   const [items, setItems] = useState<OrderItem[]>([{ name: '', quantity: 1, price: 0 }]);
   const [merchantNotes, setMerchantNotes] = useState('');
+  const [extractNotice, setExtractNotice] = useState<string | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
 
   // AI Chat Extraction
   const handleExtractWithAI = async () => {
     if (!rawChatText.trim()) return;
     setIsParsingAI(true);
+    setExtractNotice(null);
     try {
       const response = await parseOrderChatText(rawChatText);
       if (response && response.parsed) {
@@ -65,15 +77,27 @@ export const MerchantDashboard: React.FC<MerchantDashboardProps> = ({
         if (p.customerPhone) setCustomerPhone(p.customerPhone);
         if (p.deliveryAddress) setDeliveryAddress(p.deliveryAddress);
         if (p.city) setCity(p.city);
-        if (p.totalAmount) setTotalAmount(p.totalAmount);
         if (p.currency) setCurrency(p.currency);
         if (p.chatPlatform) setChatPlatform(p.chatPlatform);
         if (Array.isArray(p.items) && p.items.length > 0) {
-          setItems(p.items);
+          setItems(p.items.map(it => ({
+            name: it.name || '',
+            quantity: it.quantity || 1,
+            price: it.price || 0,
+          })));
         }
+        if (p.totalAmount !== undefined && p.totalAmount !== null && p.totalAmount > 0) {
+          setTotalAmount(p.totalAmount);
+        } else if (Array.isArray(p.items) && p.items.length > 0) {
+          const sum = p.items.reduce((acc, curr) => acc + (curr.price || 0) * (curr.quantity || 1), 0);
+          if (sum > 0) setTotalAmount(sum);
+        }
+
+        setExtractNotice('Extracted! Review and correct fields below before saving.');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Parse error:', err);
+      setExtractNotice('Could not parse text automatically. Please enter fields manually.');
     } finally {
       setIsParsingAI(false);
     }
@@ -100,8 +124,9 @@ export const MerchantDashboard: React.FC<MerchantDashboardProps> = ({
 
   const handleCreateOrderSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setFormError(null);
     if (!customerName || !customerPhone) {
-      alert('Please provide customer name and phone number.');
+      setFormError('Please provide customer name and phone number.');
       return;
     }
 
@@ -134,18 +159,24 @@ export const MerchantDashboard: React.FC<MerchantDashboardProps> = ({
     setTotalAmount(0);
     setItems([{ name: '', quantity: 1, price: 0 }]);
     setMerchantNotes('');
+    setExtractNotice(null);
+    setFormError(null);
   };
 
   const getCustomerLink = (order: Order) => {
     const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
-    return `${origin}?flow=customer&orderId=${order.id}&token=${order.assistanceToken}`;
+    const pathname = typeof window !== 'undefined' ? window.location.pathname : '/';
+    const compactData = encodeOrderForQR(order);
+    return `${origin}${pathname}?flow=customer&orderId=${order.id}&token=${order.assistanceToken}${compactData ? `&d=${compactData}` : ''}`;
   };
 
-  const handleCopyCustomerLink = (order: Order) => {
+  const handleCopyCustomerLink = async (order: Order) => {
     const link = getCustomerLink(order);
-    navigator.clipboard.writeText(link);
-    setCopiedOrderId(order.id);
-    setTimeout(() => setCopiedOrderId(null), 2500);
+    const copied = await copyTextToClipboard(link);
+    if (copied) {
+      setCopiedOrderId(order.id);
+      setTimeout(() => setCopiedOrderId(null), 2500);
+    }
   };
 
   const handleOpenCustomerWhatsApp = (order: Order) => {
@@ -167,9 +198,27 @@ ${link}`
   };
 
   const handleMarkDispatched = async (order: Order) => {
-    const nextStatus = order.status === 'DISPATCHED' ? 'CONFIRMED' : 'DISPATCHED';
-    const updated = await updateOrderStatus(order.id, nextStatus);
-    onOrderUpdated(updated);
+    setUpdatingOrderId(order.id);
+    try {
+      const nextStatus = order.status === 'DISPATCHED' ? 'CONFIRMED' : 'DISPATCHED';
+      const updated = await updateOrderStatus(order.id, nextStatus);
+      onOrderUpdated(updated);
+    } finally {
+      setUpdatingOrderId(null);
+    }
+  };
+
+  const handleMarkDelivered = async (order: Order) => {
+    setUpdatingOrderId(order.id);
+    try {
+      const updated = await updateOrderStatus(order.id, 'DELIVERED');
+      onOrderUpdated(updated);
+      if (activePrintOrder?.id === order.id) {
+        setActivePrintOrder(null);
+      }
+    } finally {
+      setUpdatingOrderId(null);
+    }
   };
 
   // Filter orders
@@ -187,7 +236,8 @@ ${link}`
   });
 
   const pendingCount = orders.filter((o) => o.status === 'PENDING_CONFIRMATION').length;
-  const qrReadyCount = orders.filter((o) => o.status === 'CONFIRMED' || o.status === 'DISPATCHED' || o.status === 'DELIVERED').length;
+  const qrReadyCount = orders.filter((o) => o.status === 'CONFIRMED' || o.status === 'DISPATCHED').length;
+  const deliveredCount = orders.filter((o) => o.status === 'DELIVERED').length;
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-4">
@@ -199,9 +249,28 @@ ${link}`
         </div>
 
         <div className="flex items-center gap-2">
+          {onRefresh && (
+            <button
+              type="button"
+              onClick={async () => {
+                setIsRefreshing(true);
+                try {
+                  await onRefresh();
+                } finally {
+                  setIsRefreshing(false);
+                }
+              }}
+              disabled={isRefreshing}
+              className="bg-white hover:bg-slate-50 text-slate-700 font-medium text-xs py-2 px-3 rounded border border-slate-300 flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
+              title="Check for customer confirmations"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
+              Refresh
+            </button>
+          )}
           <button
             onClick={() => setIsNewOrderModalOpen(true)}
-            className="bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs py-2 px-3.5 rounded flex items-center gap-1.5 transition-colors cursor-pointer"
+            className="bg-[#01411C] hover:bg-[#002d13] text-white font-bold text-xs py-2 px-3.5 rounded flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
           >
             <Plus className="w-3.5 h-3.5" />
             New Order
@@ -218,7 +287,7 @@ ${link}`
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
             placeholder="Search orders by number, customer, phone, city..."
-            className="w-full pl-8 pr-3 py-1.5 text-xs rounded border border-slate-300 focus:outline-none focus:border-slate-800 bg-white"
+            className="w-full pl-8 pr-3 py-1.5 text-xs rounded border border-slate-300 focus:outline-none focus:border-[#01411C] bg-white"
           />
         </div>
 
@@ -228,13 +297,14 @@ ${link}`
             { id: 'PENDING_CONFIRMATION', label: `Awaiting Input (${pendingCount})` },
             { id: 'CONFIRMED', label: `QR Ready (${qrReadyCount})` },
             { id: 'DISPATCHED', label: 'Dispatched' },
+            { id: 'DELIVERED', label: `Delivered (${deliveredCount})` },
           ].map((tab) => (
             <button
               key={tab.id}
               onClick={() => setStatusFilter(tab.id)}
               className={`text-xs px-2.5 py-1 rounded font-medium transition-colors cursor-pointer whitespace-nowrap ${
                 statusFilter === tab.id
-                  ? 'bg-slate-900 text-white'
+                  ? 'bg-[#01411C] text-white font-bold'
                   : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
               }`}
             >
@@ -269,8 +339,8 @@ ${link}`
         ) : (
           <div className="space-y-3">
             {filteredOrders.map((order) => {
-              const isConfirmed = order.status === 'CONFIRMED' || order.status === 'DISPATCHED' || order.status === 'DELIVERED';
-              const customerLink = getCustomerLink(order);
+              const isDelivered = order.status === 'DELIVERED';
+              const isConfirmed = order.status === 'CONFIRMED' || order.status === 'DISPATCHED';
 
               return (
                 <div
@@ -288,7 +358,12 @@ ${link}`
                       </span>
 
                       {/* Status Badges */}
-                      {isConfirmed ? (
+                      {isDelivered ? (
+                        <span className="text-[10px] font-bold text-slate-700 bg-slate-100 border border-slate-300 px-1.5 py-0.5 rounded flex items-center gap-1">
+                          <Lock className="w-3 h-3 text-slate-600" />
+                          Delivered (QR Deactivated)
+                        </span>
+                      ) : isConfirmed ? (
                         <span className="text-[10px] font-bold text-emerald-800 bg-emerald-50 border border-emerald-300 px-1.5 py-0.5 rounded flex items-center gap-1">
                           <CheckCircle2 className="w-3 h-3 text-emerald-700" />
                           QR Ready (Pin and Voice Verified)
@@ -329,18 +404,32 @@ ${link}`
 
                     {/* Confirmed Directions Snapshot */}
                     {order.voiceNote && (
-                      <div className="p-2 bg-slate-50 rounded border border-slate-200 text-xs text-slate-700 space-y-1 mt-1.5">
+                      <div className="p-2.5 bg-emerald-50/60 rounded border border-emerald-200 text-xs text-slate-800 space-y-1 mt-1.5">
                         <div className="flex items-center justify-between text-[11px]">
-                          <span className="font-semibold text-slate-800 flex items-center gap-1">
-                            <Volume2 className="w-3 h-3 text-emerald-700" /> Door Directions:
+                          <span className="font-bold text-[#01411C] flex items-center gap-1">
+                            <Volume2 className="w-3.5 h-3.5 text-[#01411C]" /> Confirmed Door Directions:
                           </span>
                           <span className="font-mono text-slate-500 text-[10px]">
-                            {order.voiceNote.durationSeconds}s &bull; GPS: {order.pin?.lat?.toFixed(4)}, {order.pin?.lng?.toFixed(4)}
+                            {order.voiceNote.durationSeconds}s &bull; {order.pin?.lat?.toFixed(4)}, {order.pin?.lng?.toFixed(4)}
                           </span>
                         </div>
+                        {order.voiceNote.urduTranscript && (
+                          <p dir="rtl" className="text-slate-900 font-serif text-xs leading-relaxed">
+                            "{order.voiceNote.urduTranscript}"
+                          </p>
+                        )}
                         <p className="text-slate-600 italic text-[11px]">
-                          "{order.voiceNote.transcript}"
+                          "{order.voiceNote.romanUrduTranscript || order.voiceNote.transcript}"
                         </p>
+                        {order.pin && (
+                          <button
+                            type="button"
+                            onClick={() => setInspectingPinOrder(order)}
+                            className="text-[11px] text-[#01411C] hover:text-[#002d13] underline font-bold flex items-center gap-1 cursor-pointer pt-1"
+                          >
+                            <MapPin className="w-3.5 h-3.5 text-[#01411C]" /> View Dropped Doorstep Pin on Map
+                          </button>
+                        )}
                       </div>
                     )}
                   </div>
@@ -355,11 +444,20 @@ ${link}`
 
                   {/* Right Column: Actions */}
                   <div className="flex flex-wrap lg:flex-col items-stretch gap-2 flex-shrink-0 border-t lg:border-t-0 pt-3 lg:pt-0 border-slate-100">
-                    {/* QR Button: Enabled when confirmed, disabled when awaiting customer */}
-                    {isConfirmed ? (
+                    {/* QR Button: Disabled when delivered or awaiting customer */}
+                    {isDelivered ? (
+                      <button
+                        disabled
+                        className="bg-slate-100 text-slate-500 text-xs font-medium px-3 py-1.5 rounded flex items-center justify-center gap-1.5 cursor-not-allowed border border-slate-300"
+                        title="QR code is disabled because this parcel has been delivered"
+                      >
+                        <Lock className="w-3.5 h-3.5 text-slate-500" />
+                        QR Disabled (Delivered)
+                      </button>
+                    ) : isConfirmed ? (
                       <button
                         onClick={() => setActivePrintOrder(order)}
-                        className="bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold px-3 py-1.5 rounded flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                        className="bg-[#01411C] hover:bg-[#002d13] text-white text-xs font-bold px-3 py-1.5 rounded flex items-center justify-center gap-1.5 transition-colors cursor-pointer shadow-xs"
                       >
                         <Printer className="w-3.5 h-3.5" />
                         Generate QR
@@ -376,58 +474,65 @@ ${link}`
                     )}
 
                     {/* WhatsApp Forwarding & Copy */}
-                    <div className="flex items-center gap-1.5">
-                      <button
-                        onClick={() => handleOpenCustomerWhatsApp(order)}
-                        className="flex-1 bg-white hover:bg-slate-50 text-slate-800 text-xs font-medium px-2.5 py-1.5 rounded border border-slate-300 flex items-center justify-center gap-1 transition-colors cursor-pointer"
-                        title="Send confirmation link over WhatsApp"
-                      >
-                        <MessageSquare className="w-3.5 h-3.5 text-emerald-700" />
-                        Send Link
-                      </button>
+                    {!isDelivered ? (
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => handleOpenCustomerWhatsApp(order)}
+                          className="flex-1 bg-white hover:bg-slate-50 text-slate-800 text-xs font-medium px-2.5 py-1.5 rounded border border-slate-300 flex items-center justify-center gap-1 transition-colors cursor-pointer"
+                          title="Send confirmation link over WhatsApp"
+                        >
+                          <MessageSquare className="w-3.5 h-3.5 text-emerald-700" />
+                          Send Link
+                        </button>
 
-                      <button
-                        onClick={() => handleCopyCustomerLink(order)}
-                        className="bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-2.5 py-1.5 rounded border border-slate-300 flex items-center justify-center gap-1 transition-colors cursor-pointer"
-                        title="Copy confirmation link to clipboard"
-                      >
-                        {copiedOrderId === order.id ? (
-                          <>
-                            <Check className="w-3.5 h-3.5 text-emerald-700" />
-                            Copied
-                          </>
-                        ) : (
-                          <>
-                            <Copy className="w-3.5 h-3.5" />
-                            Copy Link
-                          </>
-                        )}
-                      </button>
-                    </div>
+                        <button
+                          onClick={() => handleCopyCustomerLink(order)}
+                          className="bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-2.5 py-1.5 rounded border border-slate-300 flex items-center justify-center gap-1 transition-colors cursor-pointer"
+                          title="Copy confirmation link to clipboard"
+                        >
+                          {copiedOrderId === order.id ? (
+                            <>
+                              <Check className="w-3.5 h-3.5 text-emerald-700" />
+                              Copied
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3.5 h-3.5" />
+                              Copy Link
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="text-[11px] text-slate-500 text-center px-2 py-1 bg-slate-50 rounded border border-slate-200">
+                        Delivery complete. QR inactive.
+                      </div>
+                    )}
 
-                    {/* Direct link preview for testing */}
-                    <div className="flex items-center gap-1 text-[11px]">
-                      <a
-                        href={customerLink}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-slate-500 hover:text-slate-800 underline flex items-center gap-1"
-                      >
-                        <ExternalLink className="w-3 h-3" /> Customer Link
-                      </a>
-
-                      {isConfirmed && (
-                        <>
-                          <span className="text-slate-300">&bull;</span>
+                    {!isDelivered && (
+                      <div className="flex items-center justify-between gap-2 pt-0.5">
+                        {isConfirmed && (
                           <button
+                            type="button"
                             onClick={() => handleMarkDispatched(order)}
-                            className="text-blue-700 hover:text-blue-900 underline cursor-pointer"
+                            disabled={updatingOrderId === order.id}
+                            className="text-[11px] text-blue-700 hover:text-blue-900 underline cursor-pointer font-medium disabled:opacity-50"
                           >
-                            {order.status === 'DISPATCHED' ? 'Mark Dispatched' : 'Mark Dispatched'}
+                            {order.status === 'DISPATCHED' ? 'Dispatched' : 'Mark Dispatched'}
                           </button>
-                        </>
-                      )}
-                    </div>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => handleMarkDelivered(order)}
+                          disabled={updatingOrderId === order.id}
+                          className="ml-auto bg-white hover:bg-emerald-50 text-[#01411C] border border-[#01411C] text-[11px] font-bold px-2.5 py-1 rounded flex items-center gap-1 transition-colors cursor-pointer disabled:opacity-50"
+                          title="Mark parcel delivered and deactivate its QR code"
+                        >
+                          <CheckCircle2 className="w-3 h-3" />
+                          {updatingOrderId === order.id ? 'Updating...' : 'Mark Delivered'}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
               );
@@ -442,29 +547,84 @@ ${link}`
           order={activePrintOrder}
           isOpen={Boolean(activePrintOrder)}
           onClose={() => setActivePrintOrder(null)}
-          onOpenRiderView={() => {
-            const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
-            window.open(`${origin}?flow=rider&orderId=${activePrintOrder.id}`, '_blank');
-          }}
         />
+      )}
+
+      {/* Dropped Pin Map Inspector Modal */}
+      {inspectingPinOrder && inspectingPinOrder.pin && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/80">
+          <div className="bg-white rounded border border-slate-300 shadow-xl max-w-lg w-full overflow-hidden flex flex-col">
+            <div className="px-4 py-3 bg-[#01411C] text-white flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <MapPin className="w-4 h-4 text-emerald-300" />
+                <h3 className="font-bold text-xs text-white uppercase tracking-wider">
+                  Customer Doorstep Pin &bull; #{inspectingPinOrder.orderNumber}
+                </h3>
+              </div>
+              <button
+                onClick={() => setInspectingPinOrder(null)}
+                className="text-emerald-100 hover:text-white p-1 text-sm font-bold cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="p-4 space-y-3">
+              <LeafletMap
+                center={[inspectingPinOrder.pin.lat, inspectingPinOrder.pin.lng]}
+                markerPosition={[inspectingPinOrder.pin.lat, inspectingPinOrder.pin.lng]}
+                interactive={true}
+                zoom={17}
+                className="h-64 w-full rounded border border-slate-300 shadow-xs"
+                markerLabel={inspectingPinOrder.pin.landmarkLabel || inspectingPinOrder.customerName}
+                showLayerToggle={true}
+              />
+              <div className="bg-emerald-50 border border-emerald-200 p-2.5 rounded text-xs space-y-1">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-[#01411C]">
+                    {inspectingPinOrder.pin.landmarkLabel || 'Customer Doorstep Pin'}
+                  </span>
+                  <a
+                    href={`https://www.google.com/maps/@${inspectingPinOrder.pin.lat},${inspectingPinOrder.pin.lng},19z/data=!3m1!1e3`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-[10px] text-emerald-800 hover:text-emerald-950 underline font-semibold flex items-center gap-0.5"
+                  >
+                    Satellite View <ExternalLink className="w-2.5 h-2.5" />
+                  </a>
+                </div>
+                <p className="text-slate-600 font-mono text-[11px]">
+                  Coordinates: {inspectingPinOrder.pin.lat.toFixed(5)}, {inspectingPinOrder.pin.lng.toFixed(5)}
+                </p>
+              </div>
+            </div>
+            <div className="p-3 bg-slate-100 border-t border-slate-200 flex justify-end">
+              <button
+                onClick={() => setInspectingPinOrder(null)}
+                className="px-4 py-1.5 rounded text-xs font-bold text-white bg-[#01411C] hover:bg-[#002d13] cursor-pointer shadow-xs"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Modal: New Order Entry */}
       {isNewOrderModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/80">
           <div className="bg-white rounded border border-slate-300 shadow-xl max-w-2xl w-full overflow-hidden flex flex-col max-h-[90vh]">
-            <div className="px-5 py-3 border-b border-slate-200 bg-slate-100 flex items-center justify-between">
+            <div className="px-5 py-3 border-b-2 border-white bg-[#01411C] text-white flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <span className="w-6 h-6 rounded bg-slate-900 text-white flex items-center justify-center font-bold text-xs">
+                <span className="w-6 h-6 rounded bg-white text-[#01411C] flex items-center justify-center font-black text-xs">
                   P
                 </span>
-                <h3 className="font-semibold text-slate-900 text-sm">
+                <h3 className="font-semibold text-white text-sm">
                   New Order
                 </h3>
               </div>
               <button
                 onClick={() => setIsNewOrderModalOpen(false)}
-                className="text-slate-500 hover:text-slate-800 p-1 text-sm font-bold cursor-pointer"
+                className="text-emerald-100 hover:text-white p-1 text-sm font-bold cursor-pointer"
               >
                 ✕
               </button>
@@ -475,10 +635,10 @@ ${link}`
               <div className="bg-slate-50 border border-slate-300 rounded p-3.5 space-y-2">
                 <div className="flex items-center justify-between">
                   <label className="text-xs font-bold text-slate-800 uppercase tracking-wide">
-                    Paste WhatsApp Message
+                    Paste Customer Message (WhatsApp / Chat)
                   </label>
                   <span className="text-[11px] text-slate-500">
-                    Extracts items, phone, and address automatically
+                    Extracts items, phone, address automatically
                   </span>
                 </div>
 
@@ -487,15 +647,20 @@ ${link}`
                   value={rawChatText}
                   onChange={(e) => setRawChatText(e.target.value)}
                   placeholder="Paste the customer's raw WhatsApp message here..."
-                  className="w-full text-xs p-2.5 rounded border border-slate-300 focus:outline-none focus:border-slate-800 bg-white"
+                  className="w-full text-xs p-2.5 rounded border border-slate-300 focus:outline-none focus:border-[#01411C] bg-white"
                 />
 
-                <div className="flex items-center justify-end">
+                <div className="flex items-center justify-between gap-2">
+                  {extractNotice ? (
+                    <span className="text-[11px] font-semibold text-[#01411C] bg-emerald-50 px-2.5 py-1 rounded border border-emerald-200">
+                      {extractNotice}
+                    </span>
+                  ) : <span />}
                   <button
                     type="button"
                     onClick={handleExtractWithAI}
                     disabled={isParsingAI || !rawChatText.trim()}
-                    className="bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold px-3 py-1.5 rounded flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                    className="bg-[#01411C] hover:bg-[#002d13] text-white text-xs font-bold px-3 py-1.5 rounded flex items-center gap-1.5 disabled:opacity-50 cursor-pointer shadow-xs shrink-0"
                   >
                     {isParsingAI ? 'Extracting...' : 'Extract Fields with AI'}
                   </button>
@@ -640,6 +805,12 @@ ${link}`
                 </div>
               </div>
 
+              {formError && (
+                <p className="text-xs text-red-700 bg-red-50 px-3 py-2 rounded border border-red-200">
+                  {formError}
+                </p>
+              )}
+
               {/* Action Buttons */}
               <div className="pt-4 border-t border-slate-200 flex items-center justify-end gap-2.5">
                 <button
@@ -651,7 +822,7 @@ ${link}`
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-1.5 rounded text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 flex items-center gap-1.5 cursor-pointer"
+                  className="px-4 py-1.5 rounded text-xs font-bold text-white bg-[#01411C] hover:bg-[#002d13] flex items-center gap-1.5 cursor-pointer shadow-xs"
                 >
                   Save &amp; Generate Link
                   <ArrowRight className="w-3.5 h-3.5" />
